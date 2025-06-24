@@ -24,6 +24,8 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
         is_train=False,
         add_space_attn=True,
         fmaps_chunk_size=200,
+        preroll_frames=None,
+        hypothesis_stride_pixels=30
     ):
         """Predict tracks
 
@@ -103,7 +105,7 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
 
         # We compute track features
         fmaps_pyramid = []
-        track_feat_pyramid = []
+        # track_feat_pyramid = []
         track_feat_support_pyramid = []
         fmaps_pyramid.append(fmaps)
         for i in range(self.corr_levels - 1):
@@ -117,13 +119,14 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
             fmaps_pyramid.append(fmaps)
 
         for i in range(self.corr_levels):
+            # track features for beginning on the video, then broadcasted to all frames
             track_feat, track_feat_support = self.get_track_feat(
                 fmaps_pyramid[i],
                 queried_frames,
                 queried_coords / 2**i,
                 support_radius=self.corr_radius,
             )
-            track_feat_pyramid.append(track_feat.repeat(1, T, 1, 1))
+            # track_feat_pyramid.append(track_feat.repeat(1, T, 1, 1))
             track_feat_support_pyramid.append(track_feat_support.unsqueeze(1))
 
         D_coords = 2
@@ -132,9 +135,44 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
 
         vis = torch.zeros((B, T, N), device=device).float()
         confidence = torch.zeros((B, T, N), device=device).float()
-        coords = queried_coords.reshape(B, 1, N, 2).expand(B, T, N, 2).float()
+        coords = queried_coords.reshape(B, 1, N, 2).expand(B, T, N, 2).float()  # initial coordinates are broadcasted to all frames
 
         r = 2 * self.corr_radius + 1
+        if preroll_frames is not None:
+            print("initial coords", coords[:, preroll_frames:preroll_frames + 5, :, :])
+            # if preroll_frames is not None, we need to find the highest correlation volume for each hypothesis region
+            stride_in_features = hypothesis_stride_pixels / 4 
+
+            # Generate grid of search centers
+            h_offsets = range(0, H4, stride_in_features)
+            w_offsets = range(0, W4, stride_in_features) 
+            max_corr_volume = torch.zeros((B, T, N), device=device)
+            for h_offset in h_offsets:
+                for w_offset in w_offsets:
+                    coords_init = torch.tensor([[h_offset, w_offset]], device=device)
+                    coords_init = coords_init.expand(B, T - preroll_frames, N, 2)
+                    
+                    for i in range(self.corr_levels):
+                        corr_feat = self.get_correlation_feat(
+                            fmaps_pyramid[i][:, :T - preroll_frames], coords_init / 2**i
+                        )
+                        # track_feat_support are the support points from the beginning of the video
+                        track_feat_support = (
+                            track_feat_support_pyramid[i]
+                            .view(B, 1, r, r, N, self.latent_dim)
+                            .squeeze(1)
+                            .permute(0, 3, 1, 2, 4)
+                        )
+                        corr_volume = torch.einsum(
+                            "btnhwc,bnijc->btnhwij", corr_feat, track_feat_support
+                        )
+                        
+                        corr_volume = torch.max(corr_volume, (3, 4, 5, 6), keepdim=False)
+                        if corr_volume > max_corr_volume:
+                            max_corr_volume = corr_volume
+                            max_corr_volume_coords = coords_init
+            coords = torch.cat([queried_coords[:, :preroll_frames], max_corr_volume_coords], dim=1)
+            print("found coords", coords[:, preroll_frames:preroll_frames + 5, :, :])
 
         for it in range(iters):
             coords = coords.detach()  # B T N 2
@@ -145,6 +183,7 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
                 corr_feat = self.get_correlation_feat(
                     fmaps_pyramid[i], coords_init / 2**i
                 )
+                # track_feat_support are the support points from the beginning of the video
                 track_feat_support = (
                     track_feat_support_pyramid[i]
                     .view(B, 1, r, r, N, self.latent_dim)
