@@ -47,6 +47,8 @@ class CoTrackerPredictor(torch.nn.Module):
         grid_size: int = 0,
         grid_query_frame: int = 0,  # only for dense and regular grid tracks
         backward_tracking: bool = False,
+        preroll_frames: int = None,
+        hypothesis_stride_pixels: int = 30,
     ):
         if queries is None and grid_size == 0:
             tracks, visibilities = self._compute_dense_tracks(
@@ -63,6 +65,8 @@ class CoTrackerPredictor(torch.nn.Module):
                 add_support_grid=(grid_size == 0 or segm_mask is not None),
                 grid_query_frame=grid_query_frame,
                 backward_tracking=backward_tracking,
+                preroll_frames=preroll_frames,
+                hypothesis_stride_pixels=hypothesis_stride_pixels,
             )
 
         return tracks, visibilities
@@ -106,6 +110,8 @@ class CoTrackerPredictor(torch.nn.Module):
         add_support_grid=False,
         grid_query_frame=0,
         backward_tracking=False,
+        preroll_frames=None,
+        hypothesis_stride_pixels=30,
     ):
         B, T, C, H, W = video.shape
 
@@ -155,7 +161,7 @@ class CoTrackerPredictor(torch.nn.Module):
             queries = torch.cat([queries, grid_pts], dim=1)
 
         tracks, visibilities, *_ = self.model.forward(
-            video=video, queries=queries, iters=6
+            video=video, queries=queries, iters=6, preroll_frames=preroll_frames, hypothesis_stride_pixels=hypothesis_stride_pixels
         )
 
         if backward_tracking:

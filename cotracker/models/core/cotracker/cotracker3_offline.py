@@ -42,7 +42,7 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
                 - all_coords_predictions (List[FloatTensor[B, S, N, 2]]):
                 - mask (BoolTensor[B, T, N]):
         """
-
+        print("iters", iters)
         B, T, C, H, W = video.shape
         device = queries.device
         assert H % self.stride == 0 and W % self.stride == 0
@@ -138,23 +138,47 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
         coords = queried_coords.reshape(B, 1, N, 2).expand(B, T, N, 2).float()  # initial coordinates are broadcasted to all frames
 
         r = 2 * self.corr_radius + 1
+
         if preroll_frames is not None:
-            print("initial coords", coords[:, preroll_frames:preroll_frames + 5, :, :])
+            print("initial coords", coords[:, preroll_frames:preroll_frames + 3, :2, :])
             # if preroll_frames is not None, we need to find the highest correlation volume for each hypothesis region
-            stride_in_features = hypothesis_stride_pixels / 4 
+            stride_in_features = hypothesis_stride_pixels // 4 
+            
+            max_corr_volume = torch.zeros((B,N), device=device)
+            max_corr_volume_coords = coords.detach().clone()[:, preroll_frames:, :, :]
+            corr_volume_levels = []
+            coords_init = coords.detach().clone()[:, preroll_frames:preroll_frames + 1, :, :].view(B, N, 2)
+            for i in range(self.corr_levels):
+                corr_feat = self.get_correlation_feat(
+                    fmaps_pyramid[i][:, preroll_frames:preroll_frames + 1], coords_init / 2**i
+                )
+                # track_feat_support are the support points from the beginning of the video
+                track_feat_support = (
+                    track_feat_support_pyramid[i]
+                    .view(B, 1, r, r, N, self.latent_dim)
+                    .squeeze(1)
+                    .permute(0, 3, 1, 2, 4)
+                )
+                corr_volume = torch.einsum(
+                    "btnhwc,bnijc->btnhwij", corr_feat, track_feat_support
+                )
+
+                corr_volume = corr_volume.amax(dim=(3, 4, 5, 6)).view(B, N)
+                corr_volume_levels.append(corr_volume)
+            max_corr_volume = torch.cat(corr_volume_levels, dim=-1).mean(dim=-1)
+            max_corr_volume_coords = coords_init.view(B, 1, N, 2)
 
             # Generate grid of search centers
             h_offsets = range(0, H4, stride_in_features)
             w_offsets = range(0, W4, stride_in_features) 
-            max_corr_volume = torch.zeros((B, T, N), device=device)
             for h_offset in h_offsets:
                 for w_offset in w_offsets:
                     coords_init = torch.tensor([[h_offset, w_offset]], device=device)
-                    coords_init = coords_init.expand(B, T - preroll_frames, N, 2)
-                    
+                    coords_init = coords_init.expand(B, N, 2)
+                    corr_volume_levels = []
                     for i in range(self.corr_levels):
                         corr_feat = self.get_correlation_feat(
-                            fmaps_pyramid[i][:, :T - preroll_frames], coords_init / 2**i
+                            fmaps_pyramid[i][:, preroll_frames:preroll_frames + 1], coords_init / 2**i
                         )
                         # track_feat_support are the support points from the beginning of the video
                         track_feat_support = (
@@ -166,13 +190,17 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
                         corr_volume = torch.einsum(
                             "btnhwc,bnijc->btnhwij", corr_feat, track_feat_support
                         )
-                        
-                        corr_volume = torch.max(corr_volume, (3, 4, 5, 6), keepdim=False)
-                        if corr_volume > max_corr_volume:
-                            max_corr_volume = corr_volume
-                            max_corr_volume_coords = coords_init
-            coords = torch.cat([queried_coords[:, :preroll_frames], max_corr_volume_coords], dim=1)
-            print("found coords", coords[:, preroll_frames:preroll_frames + 5, :, :])
+
+                        corr_volume = corr_volume.amax(dim=(3, 4, 5, 6)).view(B, N)
+                        corr_volume_levels.append(corr_volume)
+                    corr_volume = torch.cat(corr_volume_levels, dim=-1).mean(dim=-1)
+                    update_mask = corr_volume > max_corr_volume
+                    update_mask_expanded = update_mask.unsqueeze(-1)
+                    max_corr_volume_coords = torch.where(update_mask_expanded, coords_init.view(B, 1, N, 2), max_corr_volume_coords)
+                    max_corr_volume = torch.where(update_mask, corr_volume, max_corr_volume)
+
+            coords = torch.cat([coords[:, :preroll_frames], max_corr_volume_coords.expand(B, T-preroll_frames, N, 2)], dim=1)
+            print("found coords", coords[:, preroll_frames:preroll_frames + 3, :2, :])
 
         for it in range(iters):
             coords = coords.detach()  # B T N 2
